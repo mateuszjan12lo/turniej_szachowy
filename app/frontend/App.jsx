@@ -1,36 +1,20 @@
 /**
  * ♟ TURNIEJ SZACHOWY — App.jsx
- * Backend: FastAPI + PostgreSQL (własny VPS)
- * Bez Supabase — cały auth przez JWT
+ * Backend: Supabase (Auth + Postgres + RLS)
+ * Tworzenie kont: Edge Function "create-user" (service_role)
+ *
+ * Połączone z branchem "develop": responsywność mobilna, backup JSON
+ * (eksport/import), szukajka + sortowanie uczestników, stopka.
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
+import { createClient } from "@supabase/supabase-js";
 
-// ─── KONFIGURACJA API ─────────────────────────────────────────────────────────
-const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
-
-// ─── API CLIENT ───────────────────────────────────────────────────────────────
-function getToken() { return localStorage.getItem("chess_token"); }
-function setToken(t) { t ? localStorage.setItem("chess_token", t) : localStorage.removeItem("chess_token"); }
-
-async function apiFetch(path, opts = {}) {
-  const token = getToken();
-  const res = await fetch(`${API}${path}`, {
-    ...opts,
-    headers: {
-      "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(opts.headers ?? {}),
-    },
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail ?? "Błąd API");
-  }
-  if (res.status === 204) return null;
-  return res.json();
-}
+// ─── KONFIGURACJA SUPABASE ─────────────────────────────────────────────────────
+const supabase = createClient(
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_ANON_KEY
+);
 
 // ─── GLOBAL CSS ───────────────────────────────────────────────────────────────
 const GLOBAL_CSS = `
@@ -49,9 +33,34 @@ const GLOBAL_CSS = `
   th    { font-family: 'IBM Plex Mono', monospace; font-weight: 600; letter-spacing:.08em; }
   input, select, button { font-family: 'IBM Plex Mono', monospace; }
 
-  ::-webkit-scrollbar       { width:5px; }
+  ::-webkit-scrollbar       { width:5px; height:5px; }
   ::-webkit-scrollbar-track { background:#111; }
   ::-webkit-scrollbar-thumb { background:#2e2a1e; border-radius:3px; }
+
+  .table-scroll { width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }
+
+  .app-grid {
+    max-width:1120px; margin:0 auto; padding:28px 20px;
+    display:grid; grid-template-columns: 1fr 300px; gap:24px; align-items:start;
+  }
+  .app-grid.no-aside { grid-template-columns: 1fr; }
+
+  .app-header {
+    padding:0 28px; height:60px;
+    display:flex; align-items:center; justify-content:space-between;
+  }
+  .app-header .subtitle { font-size:9px; }
+  .app-header .user-email { max-width:200px; }
+
+  @media (max-width: 760px) {
+    .app-grid { grid-template-columns: 1fr !important; padding:16px 12px; gap:16px; }
+    .app-header { padding:0 14px; height:auto; min-height:56px; flex-wrap:wrap; gap:8px; padding-top:10px; padding-bottom:10px; }
+    .app-header .subtitle { display:none; }
+    .app-header .user-email { display:none; }
+    .tab-row button { padding:8px 12px !important; font-size:10px !important; }
+    th, td { padding:8px 6px !important; font-size:11px !important; }
+    .mgmt-panel { padding:14px !important; }
+  }
 `;
 
 // ─── PALETA ───────────────────────────────────────────────────────────────────
@@ -93,6 +102,18 @@ function generateBuergerPairs(participants, round) {
     if (black === null) return { round_number: round, white_id: white.id, black_id: null, result: "wolny los" };
     return { round_number: round, white_id: white.id, black_id: black.id, result: "" };
   });
+}
+
+function downloadJSON(filename, data) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 // ─── MICRO COMPONENTS ─────────────────────────────────────────────────────────
@@ -166,6 +187,7 @@ function TextInput({ value, onChange, placeholder, type="text", error }) {
     <input
       type={type} value={value} onChange={onChange} placeholder={placeholder}
       onFocus={()=>setFocus(true)} onBlur={()=>setFocus(false)}
+      autoCapitalize="none" autoCorrect="off"
       style={{
         background:C.surface,
         border:`1px solid ${error ? C.red : focus ? C.gold : C.border}`,
@@ -198,23 +220,25 @@ function ErrBox({ msg }) {
 
 // ─── EKRAN LOGOWANIA ──────────────────────────────────────────────────────────
 function LoginScreen({ onLogin }) {
-  const [email,   setEmail]   = useState("");
+  const [login,   setLogin]   = useState("");
   const [pass,    setPass]    = useState("");
   const [err,     setErr]     = useState("");
   const [loading, setLoading] = useState(false);
 
   async function handleLogin() {
     setErr(""); setLoading(true);
-    try {
-      const data = await apiFetch("/auth/login", {
-        method: "POST",
-        body: { email, password: pass },
-      });
-      setToken(data.access_token);
-      onLogin(data.user, data.role);
-    } catch (e) {
-      setErr(e.message);
+    // Pole opisane jako "LOGIN" to w praktyce adres e-mail konta w Supabase Auth.
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: login, password: pass,
+    });
+    if (error) {
+      setErr(error.message === "Invalid login credentials"
+        ? "Nieprawidłowy login lub hasło"
+        : error.message);
+      setLoading(false);
+      return;
     }
+    onLogin(data.user);
     setLoading(false);
   }
 
@@ -226,6 +250,7 @@ function LoginScreen({ onLogin }) {
     <div style={{
       minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center",
       background:`radial-gradient(ellipse at 50% 30%, #1c1608 0%, ${C.bg} 70%)`,
+      padding:"20px",
     }}>
       <div style={{
         position:"fixed", inset:0, opacity:.03, pointerEvents:"none",
@@ -235,7 +260,7 @@ function LoginScreen({ onLogin }) {
 
       <div className="fade-up" style={{
         background:C.panel, border:`1px solid ${C.border}`,
-        borderRadius:8, padding:"40px 36px", width:360,
+        borderRadius:8, padding:"40px 36px", width:360, maxWidth:"100%",
         boxShadow:`0 24px 60px rgba(0,0,0,.6)`,
       }}>
         <div style={{ textAlign:"center", marginBottom:32 }}>
@@ -250,9 +275,9 @@ function LoginScreen({ onLogin }) {
         </div>
 
         <div style={{ display:"flex", flexDirection:"column", gap:14 }} onKeyDown={handleKeyDown}>
-          <Field label="ADRES E-MAIL">
-            <TextInput value={email} onChange={e=>setEmail(e.target.value)}
-              placeholder="adres@email.pl" type="email" error={!!err} />
+          <Field label="LOGIN">
+            <TextInput value={login} onChange={e=>setLogin(e.target.value)}
+              placeholder="login" type="text" error={!!err} />
           </Field>
           <Field label="HASŁO">
             <TextInput value={pass} onChange={e=>setPass(e.target.value)}
@@ -264,7 +289,7 @@ function LoginScreen({ onLogin }) {
 
         <Divider label="LUB" />
 
-        <Btn variant="ghost" full onClick={() => onLogin(null, "guest")}>
+        <Btn variant="ghost" full onClick={() => onLogin(null)}>
           Kontynuuj jako gość (tylko podgląd)
         </Btn>
       </div>
@@ -298,6 +323,7 @@ function PairsTable({ pairs, participants, canEdit, onResultChange }) {
             }}>RUNDA {r}</div>
             <div style={{ flex:1, borderTop:`1px solid ${C.border}` }} />
           </div>
+          <div className="table-scroll">
           <table>
             <thead>
               <tr style={{ borderBottom:`2px solid ${C.border}` }}>
@@ -362,6 +388,7 @@ function PairsTable({ pairs, participants, canEdit, onResultChange }) {
               })}
             </tbody>
           </table>
+          </div>
         </div>
       ))}
     </div>
@@ -402,6 +429,7 @@ function Scoreboard({ participants, pairs }) {
         color:C.gold, fontWeight:700, fontSize:11,
         letterSpacing:".15em", marginBottom:12,
       }}>KLASYFIKACJA GENERALNA</div>
+      <div className="table-scroll">
       <table>
         <thead>
           <tr style={{borderBottom:`2px solid ${C.border}`}}>
@@ -433,36 +461,142 @@ function Scoreboard({ participants, pairs }) {
           ))}
         </tbody>
       </table>
+      </div>
     </div>
   );
 }
 
 // ─── PANEL UCZESTNIKÓW ────────────────────────────────────────────────────────
 function ParticipantsPanel({ participants, canDelete, onDelete }) {
+  const [query, setQuery]       = useState("");
+  const [sortBy, setSortBy]     = useState("imie"); // "imie" | "klasa"
+  const [sortDir, setSortDir]   = useState("asc");  // "asc" | "desc"
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    let list = participants;
+    if (q) {
+      list = list.filter(p =>
+        p.imie.toLowerCase().includes(q) || p.klasa.toLowerCase().includes(q)
+      );
+    }
+    list = [...list].sort((a,b) => {
+      const r = String(a[sortBy]).localeCompare(String(b[sortBy]), "pl");
+      return sortDir === "asc" ? r : -r;
+    });
+    return list;
+  }, [participants, query, sortBy, sortDir]);
+
+  function toggleSort(field) {
+    if (sortBy === field) setSortDir(d => d==="asc" ? "desc" : "asc");
+    else { setSortBy(field); setSortDir("asc"); }
+  }
+
   if (!participants.length) return (
     <div style={{color:C.muted,fontSize:12,padding:"10px 0"}}>Brak uczestników.</div>
   );
+
   return (
-    <div style={{display:"flex",flexWrap:"wrap",gap:7,marginTop:8}}>
-      {participants.map(p=>(
-        <div key={p.id} className="fade-in" style={{
-          background:C.surface, border:`1px solid ${C.border}`,
-          borderRadius:4, padding:"6px 10px",
-          display:"flex", alignItems:"center", gap:8, fontSize:12,
-        }}>
-          <span style={{color:C.white}}>{p.imie}</span>
-          <span style={{
-            background:C.border, color:C.muted,
-            borderRadius:3, padding:"1px 6px", fontSize:10, letterSpacing:".06em",
-          }}>{p.klasa}</span>
-          {canDelete && (
-            <button onClick={()=>onDelete(p.id)} style={{
-              background:"none", border:"none", color:C.red,
-              cursor:"pointer", fontSize:15, lineHeight:1, padding:0,
-            }} title="Usuń">×</button>
-          )}
+    <div>
+      <div style={{ display:"flex", gap:6, marginTop:4, marginBottom:8 }}>
+        <TextInput
+          value={query}
+          onChange={e=>setQuery(e.target.value)}
+          placeholder="Szukaj (imię lub klasa)…"
+        />
+      </div>
+      <div style={{ display:"flex", gap:6, marginBottom:10 }}>
+        {[["imie","Imię"],["klasa","Klasa"]].map(([field,label])=>(
+          <button key={field} onClick={()=>toggleSort(field)} style={{
+            background: sortBy===field ? C.goldDim : "transparent",
+            color: sortBy===field ? C.gold : C.muted,
+            border:`1px solid ${C.border}`, borderRadius:3,
+            fontSize:10, letterSpacing:".06em", padding:"4px 9px",
+            cursor:"pointer", display:"flex", alignItems:"center", gap:4,
+          }}>
+            Sortuj: {label} {sortBy===field ? (sortDir==="asc" ? "↑" : "↓") : ""}
+          </button>
+        ))}
+      </div>
+      {filtered.length === 0 ? (
+        <div style={{color:C.muted,fontSize:12,padding:"6px 0"}}>Brak wyników.</div>
+      ) : (
+        <div style={{display:"flex",flexWrap:"wrap",gap:7}}>
+          {filtered.map(p=>(
+            <div key={p.id} className="fade-in" style={{
+              background:C.surface, border:`1px solid ${C.border}`,
+              borderRadius:4, padding:"6px 10px",
+              display:"flex", alignItems:"center", gap:8, fontSize:12,
+            }}>
+              <span style={{color:C.white}}>{p.imie}</span>
+              <span style={{
+                background:C.border, color:C.muted,
+                borderRadius:3, padding:"1px 6px", fontSize:10, letterSpacing:".06em",
+              }}>{p.klasa}</span>
+              {canDelete && (
+                <button onClick={()=>onDelete(p.id)} style={{
+                  background:"none", border:"none", color:C.red,
+                  cursor:"pointer", fontSize:15, lineHeight:1, padding:0,
+                }} title="Usuń">×</button>
+              )}
+            </div>
+          ))}
         </div>
-      ))}
+      )}
+    </div>
+  );
+}
+
+// ─── PANEL TWORZENIA KONT (tylko superadmin) ─────────────────────────────────
+function CreateUserPanel() {
+  const [email, setEmail] = useState("");
+  const [pass, setPass]   = useState("");
+  const [role, setRole]   = useState("teacher");
+  const [msg, setMsg]     = useState("");
+  const [err, setErr]     = useState("");
+  const [loading, setLoading] = useState(false);
+
+  async function handleCreate() {
+    setErr(""); setMsg(""); setLoading(true);
+    const { data, error } = await supabase.functions.invoke("create-user", {
+      body: { email, password: pass, role },
+    });
+    if (error) {
+      setErr(error.message || "Błąd tworzenia konta");
+    } else if (data?.error) {
+      setErr(data.error);
+    } else {
+      setMsg(`Utworzono konto: ${email} (${role})`);
+      setEmail(""); setPass("");
+    }
+    setLoading(false);
+  }
+
+  return (
+    <div style={{
+      background:C.surface, border:`1px solid ${C.border}`,
+      borderRadius:4, padding:14,
+    }}>
+      <div style={{color:C.goldDim,fontWeight:600,marginBottom:10,fontSize:11,letterSpacing:".08em"}}>
+        NOWE KONTO
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:8}}>
+        <TextInput value={email} onChange={e=>setEmail(e.target.value)} placeholder="login (e-mail)@szkola.pl" type="email" />
+        <TextInput value={pass} onChange={e=>setPass(e.target.value)} placeholder="hasło (min. 8 znaków)" type="password" />
+        <select
+          value={role} onChange={e=>setRole(e.target.value)}
+          style={{
+            background:C.surface, border:`1px solid ${C.border}`,
+            color:C.cream, borderRadius:4, padding:"8px 10px", fontSize:12,
+          }}
+        >
+          <option value="teacher">teacher</option>
+          <option value="superadmin">superadmin</option>
+        </select>
+        <Btn small onClick={handleCreate} loading={loading}>Utwórz konto</Btn>
+        <ErrBox msg={err} />
+        {msg && <div style={{color:C.gold,fontSize:11}}>{msg}</div>}
+      </div>
     </div>
   );
 }
@@ -480,6 +614,9 @@ export default function App() {
   const [tab,          setTab]          = useState("pairs");
   const [loading,      setLoading]      = useState(false);
   const [dataLoading,  setDataLoading]  = useState(false);
+  const [backupErr,    setBackupErr]    = useState("");
+  const [backupMsg,    setBackupMsg]    = useState("");
+  const [importing,    setImporting]    = useState(false);
 
   const nextRound = pairs.length
     ? Math.max(...pairs.map(p=>p.round_number)) + 1
@@ -488,53 +625,68 @@ export default function App() {
   const canEdit   = role==="teacher" || role==="superadmin";
   const canDelete = role==="superadmin";
 
-  // ── Wczytaj dane ────────────────────────────────────────────────────────────
+  // ── Wczytaj dane (uczestnicy + pary) ─────────────────────────────────────
   const loadData = useCallback(async () => {
     setDataLoading(true);
-    try {
-      const [prt, prs] = await Promise.all([
-        apiFetch("/participants"),
-        apiFetch("/pairs"),
-      ]);
-      setParticipants(prt ?? []);
-      setPairs(prs ?? []);
-    } catch (_) {}
+    const [{ data: prt }, { data: prs }] = await Promise.all([
+      supabase.from("participants").select("*").order("imie"),
+      supabase.from("pairs").select("*").order("round_number").order("id"),
+    ]);
+    setParticipants(prt ?? []);
+    setPairs(prs ?? []);
     setDataLoading(false);
   }, []);
 
-  // ── Sprawdź zapisany token ───────────────────────────────────────────────
+  // ── Wczytaj rolę zalogowanego użytkownika z tabeli profiles ──────────────
+  async function loadRole(userId) {
+    const { data } = await supabase
+      .from("profiles")
+      .select("role")
+      .eq("id", userId)
+      .single();
+    return data?.role ?? "teacher";
+  }
+
+  // ── Sprawdź istniejącą sesję + nasłuchuj zmian logowania ──────────────────
   useEffect(() => {
-    const token = getToken();
-    if (!token) { setUser(null); return; }
-    apiFetch("/auth/me")
-      .then(me => {
-        setUser({ email: me.email });
-        setRole(me.role);
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
+      if (session?.user) {
+        const r = await loadRole(session.user.id);
+        setUser(session.user);
+        setRole(r);
         loadData();
-      })
-      .catch(() => {
-        setToken(null);
+      } else {
         setUser(null);
-      });
+      }
+    });
+
+    const { data: listener } = supabase.auth.onAuthStateChange(async (_event, session) => {
+      if (session?.user) {
+        const r = await loadRole(session.user.id);
+        setUser(session.user);
+        setRole(r);
+        setIsGuest(false);
+        loadData();
+      }
+    });
+
+    return () => listener.subscription.unsubscribe();
   }, [loadData]);
 
-  // ── Logowanie ───────────────────────────────────────────────────────────────
-  function handleLogin(u, r) {
-    if (u === null && r === "guest") {
+  // ── Logowanie (login) lub tryb gościa ─────────────────────────────────────
+  function handleLogin(u) {
+    if (u === null) {
       setIsGuest(true);
       setRole("guest");
       loadData();
       return;
     }
-    setUser(u);
-    setRole(r);
-    setIsGuest(false);
-    if (u) loadData();
+    // reszta (user, role) ustawi się przez onAuthStateChange powyżej
   }
 
   // ── Wylogowanie ─────────────────────────────────────────────────────────────
-  function handleLogout() {
-    setToken(null);
+  async function handleLogout() {
+    await supabase.auth.signOut();
     setUser(null);
     setIsGuest(false);
     setRole("guest");
@@ -553,25 +705,27 @@ export default function App() {
     if (!imie || !klasa) { setAddErr("Nieprawidłowy format."); return; }
 
     setLoading(true);
-    try {
-      const data = await apiFetch("/participants", {
-        method: "POST",
-        body: { imie, klasa },
-      });
+    const { data, error } = await supabase
+      .from("participants")
+      .insert({ imie, klasa })
+      .select()
+      .single();
+
+    if (error) {
+      setAddErr(error.message);
+    } else {
       setParticipants(prev =>
         [...prev, data].sort((a,b)=>a.imie.localeCompare(b.imie,"pl"))
       );
       setInputVal("");
-    } catch (e) {
-      setAddErr(e.message);
     }
     setLoading(false);
   }
 
   // ── Usuń uczestnika ─────────────────────────────────────────────────────────
   async function deleteParticipant(id) {
-    await apiFetch(`/participants/${id}`, { method: "DELETE" });
-    setParticipants(prev => prev.filter(p=>p.id!==id));
+    const { error } = await supabase.from("participants").delete().eq("id", id);
+    if (!error) setParticipants(prev => prev.filter(p=>p.id!==id));
   }
 
   // ── Generuj pary ────────────────────────────────────────────────────────────
@@ -580,14 +734,11 @@ export default function App() {
     if (participants.length < 2) { setGenErr("Minimum 2 uczestników."); return; }
     const newPairs = generateBuergerPairs(participants, nextRound);
     setLoading(true);
-    try {
-      const data = await apiFetch("/pairs", {
-        method: "POST",
-        body: { pairs: newPairs },
-      });
+    const { data, error } = await supabase.from("pairs").insert(newPairs).select();
+    if (error) {
+      setGenErr(error.message);
+    } else {
       setPairs(prev => [...prev, ...data]);
-    } catch (e) {
-      setGenErr(e.message);
     }
     setLoading(false);
   }
@@ -595,10 +746,7 @@ export default function App() {
   // ── Edytuj wynik ────────────────────────────────────────────────────────────
   async function handleResultChange(pairId, result) {
     setPairs(prev => prev.map(p=>p.id===pairId ? {...p,result} : p));
-    await apiFetch(`/pairs/${pairId}`, {
-      method: "PATCH",
-      body: { result },
-    });
+    await supabase.from("pairs").update({ result }).eq("id", pairId);
   }
 
   // ── Reset turnieju ──────────────────────────────────────────────────────────
@@ -607,11 +755,88 @@ export default function App() {
       "Zresetować cały turniej? Usunięte zostaną pary i wszyscy uczestnicy."
     )) return;
     setLoading(true);
-    await apiFetch("/pairs",        { method: "DELETE" });
-    await apiFetch("/participants", { method: "DELETE" });
+    await supabase.from("pairs").delete().neq("id", 0);
+    await supabase.from("participants").delete().neq("id", 0);
     setPairs([]);
     setParticipants([]);
     setLoading(false);
+  }
+
+  // ── Eksport backupu (JSON: uczestnicy + pary) ───────────────────────────────
+  function handleExportBackup() {
+    setBackupErr(""); setBackupMsg("");
+    const backup = {
+      version: 1,
+      exported_at: new Date().toISOString(),
+      participants,
+      pairs,
+    };
+    const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,"-");
+    downloadJSON(`turniej-szachowy-backup-${stamp}.json`, backup);
+    setBackupMsg("Backup pobrany.");
+  }
+
+  // ── Import backupu (odtwarza uczestników i pary przez Supabase) ─────────────
+  async function handleImportBackup(e) {
+    setBackupErr(""); setBackupMsg("");
+    const file = e.target.files?.[0];
+    e.target.value = ""; // umożliwia ponowny wybór tego samego pliku
+    if (!file) return;
+
+    let parsed;
+    try {
+      const text = await file.text();
+      parsed = JSON.parse(text);
+    } catch {
+      setBackupErr("Nieprawidłowy plik backupu (błąd JSON).");
+      return;
+    }
+
+    const importedParticipants = Array.isArray(parsed.participants) ? parsed.participants : [];
+    const importedPairs        = Array.isArray(parsed.pairs)        ? parsed.pairs        : [];
+    if (!importedParticipants.length && !importedPairs.length) {
+      setBackupErr("Plik nie zawiera danych do zaimportowania.");
+      return;
+    }
+
+    if (!window.confirm(
+      `Zaimportować backup? Zostanie utworzonych ${importedParticipants.length} uczestników i ${importedPairs.length} par (dodane do obecnych danych, bez usuwania istniejących).`
+    )) return;
+
+    setImporting(true);
+    try {
+      // mapa starych id -> nowe id, bo Supabase nadaje nowe identyfikatory
+      const idMap = {};
+      for (const p of importedParticipants) {
+        const { data: created, error } = await supabase
+          .from("participants")
+          .insert({ imie: p.imie, klasa: p.klasa })
+          .select()
+          .single();
+        if (error) throw error;
+        idMap[p.id] = created.id;
+      }
+
+      const mappedPairs = importedPairs
+        .map(pr => ({
+          round_number: pr.round_number,
+          white_id: idMap[pr.white_id] ?? pr.white_id,
+          black_id: pr.black_id == null ? null : (idMap[pr.black_id] ?? pr.black_id),
+          result: pr.result ?? "",
+        }))
+        .filter(pr => pr.white_id != null);
+
+      if (mappedPairs.length) {
+        const { error } = await supabase.from("pairs").insert(mappedPairs);
+        if (error) throw error;
+      }
+
+      await loadData();
+      setBackupMsg(`Zaimportowano ${importedParticipants.length} uczestników i ${mappedPairs.length} par.`);
+    } catch (err) {
+      setBackupErr(`Błąd importu: ${err.message}`);
+    }
+    setImporting(false);
   }
 
   // ── Ładowanie sesji ─────────────────────────────────────────────────────────
@@ -636,10 +861,8 @@ export default function App() {
     <>
       <style>{GLOBAL_CSS}</style>
 
-      <header style={{
+      <header className="app-header" style={{
         background:C.black, borderBottom:`1px solid ${C.border}`,
-        padding:"0 28px", display:"flex", alignItems:"center",
-        justifyContent:"space-between", height:60,
         position:"sticky", top:0, zIndex:100,
       }}>
         <div style={{display:"flex",alignItems:"center",gap:12}}>
@@ -649,13 +872,13 @@ export default function App() {
               fontFamily:"'Playfair Display', serif",
               fontSize:18, fontWeight:900, color:C.gold, lineHeight:1.1,
             }}>TURNIEJ SZACHOWY</div>
-            <div style={{fontSize:9,color:C.muted,letterSpacing:".2em"}}>XII Liceum Ogólnokształcące im. Henryka Sienkiewicza w Warszawie</div>
+            <div className="subtitle" style={{color:C.muted,letterSpacing:".2em"}}>XII Liceum Ogólnokształcące im. Henryka Sienkiewicza w Warszawie</div>
           </div>
         </div>
 
         <div style={{display:"flex",alignItems:"center",gap:12}}>
           {role!=="guest" && (
-            <span style={{color:C.muted,fontSize:11,maxWidth:200,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+            <span className="user-email" style={{color:C.muted,fontSize:11,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
               {user?.email}
             </span>
           )}
@@ -668,14 +891,9 @@ export default function App() {
         </div>
       </header>
 
-      <div style={{
-        maxWidth:1120, margin:"0 auto", padding:"28px 20px",
-        display:"grid",
-        gridTemplateColumns: canEdit ? "1fr 300px" : "1fr",
-        gap:24, alignItems:"start",
-      }}>
+      <div className={`app-grid${canEdit ? "" : " no-aside"}`}>
         <main>
-          <div style={{display:"flex",gap:2,marginBottom:20}}>
+          <div className="tab-row" style={{display:"flex",gap:2,marginBottom:20}}>
             {[["pairs","Pary i wyniki"],["score","Klasyfikacja"]].map(([k,label])=>(
               <button key={k} onClick={()=>setTab(k)} style={{
                 background: tab===k ? C.gold : C.surface,
@@ -711,7 +929,7 @@ export default function App() {
 
         {canEdit && (
           <aside className="fade-up" style={{display:"flex",flexDirection:"column",gap:16}}>
-            <div style={{
+            <div className="mgmt-panel" style={{
               background:C.panel, border:`1px solid ${C.border}`,
               borderRadius:4, padding:20,
             }}>
@@ -762,6 +980,37 @@ export default function App() {
                 </>
               )}
 
+              <Divider label="BACKUP" />
+
+              <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                <Btn variant="ghost" full onClick={handleExportBackup}>
+                  ⭳ Eksportuj backup (JSON)
+                </Btn>
+                <label style={{ width:"100%" }}>
+                  <div style={{
+                    border:`1px solid ${C.border}`, borderRadius:4,
+                    padding:"10px 22px", textAlign:"center",
+                    fontSize:13, fontWeight:600, letterSpacing:".06em",
+                    color: importing ? C.muted : C.cream,
+                    cursor: importing ? "not-allowed" : "pointer",
+                    display:"flex", alignItems:"center", justifyContent:"center", gap:8,
+                  }}>
+                    {importing && <Spinner />}
+                    ⭱ {importing ? "Importowanie…" : "Importuj backup"}
+                  </div>
+                  <input
+                    type="file" accept="application/json,.json"
+                    onChange={handleImportBackup}
+                    disabled={importing}
+                    style={{ display:"none" }}
+                  />
+                </label>
+                <ErrBox msg={backupErr} />
+                {backupMsg && (
+                  <div style={{ color:C.gold, fontSize:11, marginTop:2 }}>{backupMsg}</div>
+                )}
+              </div>
+
               <Divider label="UCZESTNICY" />
 
               <div style={{
@@ -782,6 +1031,8 @@ export default function App() {
               />
             </div>
 
+            {canDelete && <CreateUserPanel />}
+
             <div style={{
               background:C.surface, border:`1px solid ${C.border}`,
               borderRadius:4, padding:14, fontSize:11, color:C.muted, lineHeight:1.9,
@@ -801,7 +1052,17 @@ export default function App() {
         textAlign:"center", color:C.muted, fontSize:10,
         padding:"24px 0 40px", letterSpacing:".12em",
       }}>
-        ♟ TURNIEJ SZACHOWY · {new Date().getFullYear()}
+        <div>♟ TURNIEJ SZACHOWY · {new Date().getFullYear()}</div>
+        <div style={{ marginTop:6, fontSize:9, letterSpacing:".08em", opacity:.55 }}>
+          created by{" "}
+          <a
+            href="https://github.com/mat-jan/"
+            target="_blank" rel="noopener noreferrer"
+            style={{ color:C.muted, textDecoration:"none", borderBottom:`1px dotted ${C.border}` }}
+          >
+            mat-jan (mat-jan)
+          </a>
+        </div>
       </footer>
     </>
   );
